@@ -1,8 +1,9 @@
 import { type NextRequest } from "next/server";
+import https from "node:https";
 
 type GstInput = {
   gstin: string;
-  fy: string;
+  fy: string; // four-digit start year, e.g. "2025"
 };
 
 type FilingRow = {
@@ -17,11 +18,8 @@ type FilingRow = {
 
 type ReturnStatus = {
   returnType: string;
-  /** "Filed" | "Not Filed" | "NA" */
   overallStatus: string;
-  /** Comma-separated list of filed quarters/months */
   filedPeriods: string;
-  /** Comma-separated list of unfiled quarters/months */
   notFiledPeriods: string;
   latestFiledOn: string | null;
   totalPeriods: number;
@@ -45,17 +43,6 @@ type ErrorResponse = {
   message: string;
 };
 
-const GST_PORTAL_HEADERS = {
-  Accept: "application/json, text/plain, */*",
-  "Accept-Language": "en-US,en;q=0.9",
-  Origin: "https://services.gst.gov.in",
-  Pragma: "no-cache",
-  Referer: "https://services.gst.gov.in/services/searchtp",
-  "User-Agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-  "X-Requested-With": "XMLHttpRequest",
-} as const;
-
 const GSTIN_PATTERN = /^[0-9A-Z]{15}$/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -77,13 +64,11 @@ function financialYearLabel(fy: string): string {
   return `${start}-${String(start + 1).slice(-2)}`;
 }
 
-function parseJsonText(text: string): unknown {
-  if (!text) return null;
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    return text;
-  }
+/** Full FY string required by the GST portal API e.g. "2025-2026" */
+function portalFyString(fy: string): string {
+  const start = Number(fy);
+  if (!Number.isFinite(start)) return fy;
+  return `${start}-${start + 1}`;
 }
 
 function pickString(record: Record<string, unknown>, keys: string[]): string | null {
@@ -94,40 +79,22 @@ function pickString(record: Record<string, unknown>, keys: string[]): string | n
   return null;
 }
 
-function flattenRecords(value: unknown): Record<string, unknown>[] {
-  const queue: unknown[] = [value];
-  const records: Record<string, unknown>[] = [];
-  while (queue.length > 0) {
-    const current = queue.shift();
-    if (Array.isArray(current)) {
-      queue.unshift(...current);
-      continue;
-    }
-    if (isRecord(current)) {
-      records.push(current);
-      queue.push(...Object.values(current));
+function extractFilingRows(data: unknown): FilingRow[] {
+  if (!isRecord(data)) return [];
+  const fs = data["filingStatus"];
+  if (!fs) return [];
+
+  // Portal returns: { filingStatus: [[row, row, ...]] } — one level of nesting
+  const flatRows: unknown[] = [];
+  if (Array.isArray(fs)) {
+    for (const item of fs) {
+      if (Array.isArray(item)) flatRows.push(...item);
+      else flatRows.push(item);
     }
   }
-  return records;
-}
 
-function findRecordWithKeys(value: unknown, keys: string[]): Record<string, unknown> | null {
-  const queue: unknown[] = [value];
-  while (queue.length > 0) {
-    const current = queue.shift();
-    if (Array.isArray(current)) { queue.unshift(...current); continue; }
-    if (!isRecord(current)) continue;
-    if (keys.some((k) => k in current)) return current;
-    queue.push(...Object.values(current));
-  }
-  return null;
-}
-
-function extractFilingRows(value: unknown): FilingRow[] {
-  const source = findRecordWithKeys(value, ["filingStatus"]);
-  if (!source) return [];
-  const rows = flattenRecords(source["filingStatus"]);
-  return rows
+  return flatRows
+    .filter(isRecord)
     .map((record) => ({
       fy: pickString(record, ["fy"]) ?? "",
       taxp: pickString(record, ["taxp"]) ?? "",
@@ -137,7 +104,7 @@ function extractFilingRows(value: unknown): FilingRow[] {
       arn: pickString(record, ["arn"]) ?? "",
       status: pickString(record, ["status"]) ?? "",
     }))
-    .filter((row) => row.taxp.length > 0 || row.rtntype.length > 0);
+    .filter((row) => row.rtntype.length > 0);
 }
 
 function latestDateLabel(values: string[]): string | null {
@@ -171,32 +138,82 @@ function buildReturnStatuses(rows: FilingRow[]): ReturnStatus[] {
 
     const total = groupedRows.length;
     const filedCount = filedRows.length;
-    // Simple Filed / Not Filed — if even one period is missing it's Not Filed
+    // "Filed" = at least one period filed (more lenient than requiring all periods)
     const overallStatus =
-      total === 0 ? "Not Filed"
-      : filedCount === total ? "Filed"
-      : "Not Filed";
+      filedCount > 0 ? "Filed" : "Not Filed";
 
     return { returnType, overallStatus, filedPeriods, notFiledPeriods, latestFiledOn: latest, totalPeriods: total, filedCount };
   }).sort((a, b) => a.returnType.localeCompare(b.returnType));
 }
 
-async function fetchReturnDetails(input: GstInput): Promise<{ rows: FilingRow[]; rawStatus: string }> {
-  try {
-    const response = await fetch(
-      "https://services.gst.gov.in/services/api/search/taxpayerReturnDetails",
+/**
+ * Use Node's native https module instead of fetch (undici).
+ * fetch/undici has a different TLS fingerprint that gets blocked by the GST portal WAF.
+ * Node's https module matches the fingerprint our local tests use — which works.
+ */
+function nodeHttpsPost(
+  hostname: string,
+  path: string,
+  body: string,
+  headers: Record<string, string | number>,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const req = https.request(
       {
+        hostname,
+        path,
         method: "POST",
-        cache: "no-store",
-        headers: { ...GST_PORTAL_HEADERS, "Content-Type": "application/json" },
-        body: JSON.stringify({ gstin: input.gstin, fy: input.fy }),
+        headers: { ...headers, "Content-Length": Buffer.byteLength(body) },
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (chunk: Buffer) => { data += chunk.toString(); });
+        res.on("end", () => resolve(data));
+        res.on("error", reject);
       },
     );
-    const text = await response.text();
-    const data = parseJsonText(text);
-    const rows = extractFilingRows(data);
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
 
-    // Extract top-level status message from portal response
+async function fetchReturnDetails(input: GstInput): Promise<{ rows: FilingRow[]; rawStatus: string }> {
+  try {
+    const fyForPortal = portalFyString(input.fy);
+    const bodyStr = JSON.stringify({ gstin: input.gstin, fy: fyForPortal });
+
+    console.log(`[GST] POST gstin=${input.gstin} fy=${fyForPortal}`);
+
+    const text = await nodeHttpsPost(
+      "services.gst.gov.in",
+      "/services/api/search/taxpayerReturnDetails",
+      bodyStr,
+      {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Origin": "https://services.gst.gov.in",
+        "Referer": "https://services.gst.gov.in/services/searchtp",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "X-Requested-With": "XMLHttpRequest",
+      },
+    );
+
+    console.log(`[GST] Response length=${text.length} preview=${text.substring(0, 80)}`);
+
+    // Guard: portal WAF sometimes returns HTML rejection page with HTTP 200
+    if (text.trim().startsWith("<")) {
+      console.error("[GST] Got HTML response instead of JSON — WAF/portal rejection");
+      return { rows: [], rawStatus: "Portal rejected the request" };
+    }
+
+    let data: unknown;
+    try { data = JSON.parse(text); } catch { return { rows: [], rawStatus: "Invalid JSON from portal" }; }
+
+    const rows = extractFilingRows(data);
+    console.log(`[GST] Extracted ${rows.length} filing rows`);
+
     let rawStatus = "No records found";
     if (isRecord(data)) {
       const s = data["status"];
@@ -205,7 +222,7 @@ async function fetchReturnDetails(input: GstInput): Promise<{ rows: FilingRow[];
     if (rows.length > 0) rawStatus = "OK";
     return { rows, rawStatus };
   } catch (err) {
-    console.error("[returnDetails] Error:", err);
+    console.error("[GST] Error:", err);
     return { rows: [], rawStatus: "Error fetching data" };
   }
 }
