@@ -102,6 +102,23 @@ export async function POST(request: NextRequest) {
     }
 
     const text = await response.text();
+
+    // Debug: log response headers to help identify WAF/proxy blocking
+    try {
+      const headersObj: Record<string, string> = {};
+      for (const [k, v] of response.headers) {
+        headersObj[k] = v;
+      }
+      console.log("[SHEET] Response headers:", headersObj);
+    } catch (e) {
+      console.warn("[SHEET] Could not read response headers", e);
+    }
+
+    if (response.headers.get("content-type")?.includes("text/html") && text.includes("Request Rejected")) {
+      console.error("[SHEET] Upstream blocked request — received HTML 'Request Rejected' page");
+      return Response.json({ success: false, message: "Upstream blocked request (received HTML 'Request Rejected')" }, { status: 502 });
+    }
+
     const parsed = parseCsv(text);
 
     if (parsed.length === 0) {
